@@ -1,6 +1,7 @@
 package cl.inacap.invernaderoiot
 
 import android.os.Bundle
+import android.content.Context
 import android.util.Patterns
 
 import androidx.activity.ComponentActivity
@@ -55,9 +56,10 @@ import com.google.firebase.database.*
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlinx.coroutines.delay
 
 // =====================================================
-// INVERNADERO IoT - VERSION 7.23 CORREGIDA
+// INVERNADERO IoT - VERSION 7.24 - BLOQUEO LOCAL DE ACCESO
 // PARTE 1 DE 4
 // =====================================================
 
@@ -571,7 +573,7 @@ fun LogoInvernadero(
 // =====================================================
 
 // =====================================================
-// INVERNADERO IoT - VERSION 7.23 CORREGIDA
+// INVERNADERO IoT - VERSION 7.24 - BLOQUEO LOCAL DE ACCESO
 // PARTE 2 DE 4
 // LOGIN, REGISTRO Y COMPONENTES COMPARTIDOS
 // =====================================================
@@ -616,6 +618,46 @@ fun PantallaLogin(
     var mensaje by remember {
         mutableStateOf("")
     }
+
+    // Bloqueo local por dispositivo, persistente al reiniciar la aplicación.
+    // Para proteger una cuenta entre dispositivos se requiere control en servidor.
+    val contexto = androidx.compose.ui.platform.LocalContext.current
+    val preferencias = remember(contexto) {
+        contexto.getSharedPreferences("seguridad_login", Context.MODE_PRIVATE)
+    }
+    val maxIntentos = 5
+    val duracionBloqueo = 30L * 60L * 1000L
+    var intentosFallidos by remember {
+        mutableIntStateOf(preferencias.getInt("intentos_fallidos", 0))
+    }
+    var bloqueoHasta by remember {
+        mutableLongStateOf(preferencias.getLong("bloqueo_hasta", 0L))
+    }
+    var ahora by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    LaunchedEffect(bloqueoHasta) {
+        while (bloqueoHasta > 0L) {
+            ahora = System.currentTimeMillis()
+            if (ahora >= bloqueoHasta) {
+                bloqueoHasta = 0L
+                intentosFallidos = 0
+                preferencias.edit()
+                    .putLong("bloqueo_hasta", 0L)
+                    .putInt("intentos_fallidos", 0)
+                    .apply()
+                break
+            }
+            delay(1000L)
+        }
+    }
+
+    val bloqueado = bloqueoHasta > ahora
+    val segundosRestantes = if (bloqueado) {
+        (bloqueoHasta - ahora + 999L) / 1000L
+    } else 0L
+    val tiempoRestante = "%02d:%02d".format(
+        segundosRestantes / 60L, segundosRestantes % 60L
+    )
 
     Surface(
         modifier = Modifier.fillMaxSize()
@@ -698,7 +740,7 @@ fun PantallaLogin(
 
                         OutlinedCard(
                             onClick = {
-                                if (!cargando) {
+                                if (!cargando && !bloqueado) {
                                     rolSeleccionado = perfil.first
                                 }
                             },
@@ -772,7 +814,7 @@ fun PantallaLogin(
                         Text("Correo electrónico")
                     },
                     singleLine = true,
-                    enabled = !cargando,
+                    enabled = !cargando && !bloqueado,
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Email
                     ),
@@ -792,7 +834,7 @@ fun PantallaLogin(
                         Text("Contraseña")
                     },
                     singleLine = true,
-                    enabled = !cargando,
+                    enabled = !cargando && !bloqueado,
                     visualTransformation =
                         if (mostrarContrasena) {
                             VisualTransformation.None
@@ -833,9 +875,12 @@ fun PantallaLogin(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(50.dp),
-                    enabled = !cargando,
+                    enabled = !cargando && !bloqueado,
                     onClick = {
-                        if (
+                        ahora = System.currentTimeMillis()
+                        if (bloqueoHasta > ahora) {
+                            mensaje = "Acceso bloqueado. Espera $tiempoRestante."
+                        } else if (
                             correo.isBlank() ||
                             contrasena.isBlank()
                         ) {
@@ -852,11 +897,44 @@ fun PantallaLogin(
                                 cargando = false
 
                                 if (tarea.isSuccessful) {
+                                    intentosFallidos = 0
+                                    bloqueoHasta = 0L
+                                    preferencias.edit()
+                                        .putInt("intentos_fallidos", 0)
+                                        .putLong("bloqueo_hasta", 0L)
+                                        .apply()
                                     contrasena = ""
                                     onLoginCorrecto()
                                 } else {
-                                    mensaje =
-                                        "Credenciales incorrectas o acceso no disponible."
+                                    // Se contabilizan los rechazos de autenticación.
+                                    // No se contabilizan errores de red ni exceso de solicitudes.
+                                    val codigo = (tarea.exception as?
+                                            com.google.firebase.auth.FirebaseAuthException)?.errorCode
+                                    val falloCredenciales = codigo in setOf(
+                                        "ERROR_WRONG_PASSWORD",
+                                        "ERROR_INVALID_CREDENTIAL",
+                                        "ERROR_INVALID_EMAIL",
+                                        "ERROR_USER_NOT_FOUND"
+                                    )
+                                    if (falloCredenciales) {
+                                        intentosFallidos += 1
+                                        if (intentosFallidos >= maxIntentos) {
+                                            bloqueoHasta = System.currentTimeMillis() + duracionBloqueo
+                                            ahora = System.currentTimeMillis()
+                                            preferencias.edit()
+                                                .putInt("intentos_fallidos", intentosFallidos)
+                                                .putLong("bloqueo_hasta", bloqueoHasta)
+                                                .apply()
+                                            mensaje = "Acceso bloqueado por 30 minutos tras 5 intentos fallidos."
+                                        } else {
+                                            preferencias.edit()
+                                                .putInt("intentos_fallidos", intentosFallidos)
+                                                .apply()
+                                            mensaje = "Credenciales incorrectas. Quedan ${maxIntentos - intentosFallidos} intentos."
+                                        }
+                                    } else {
+                                        mensaje = "No se pudo iniciar sesión. Revisa la conexión e inténtalo nuevamente."
+                                    }
                                 }
                             }
                         }
@@ -875,8 +953,13 @@ fun PantallaLogin(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(50.dp),
-                    enabled = !cargando
+                    enabled = !cargando && !bloqueado
                 )
+
+                if (bloqueado) {
+                    Spacer(Modifier.height(12.dp))
+                    Aviso("Inicio de sesión bloqueado. Tiempo restante: $tiempoRestante", ROJO)
+                }
 
                 if (cargando) {
                     Spacer(Modifier.height(12.dp))
@@ -1445,7 +1528,7 @@ private fun Aviso(
 // =====================================================
 
 // =====================================================
-// INVERNADERO IoT - VERSION 7.23 CORREGIDA
+// INVERNADERO IoT - VERSION 7.24 - BLOQUEO LOCAL DE ACCESO
 // PARTE 3 DE 4
 // PANEL PRINCIPAL, SENSORES, VENTILADOR Y ALERTAS
 // =====================================================
@@ -3196,7 +3279,7 @@ private fun AlertaTemperatura(
 // =====================================================
 
 // =====================================================
-// INVERNADERO IoT - VERSION 7.23 CORREGIDA
+// INVERNADERO IoT - VERSION 7.24 - BLOQUEO LOCAL DE ACCESO
 // PARTE 4 DE 4
 // ADMINISTRACION, HISTORIALES Y CONFIGURACION
 // =====================================================
